@@ -29,14 +29,13 @@ def list_rules(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return out
 
 
-_GLOBAL_RULES: dict[str, dict[str, Any]] | None = None
-
-
 def rules_map(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
-    global _GLOBAL_RULES
-    if _GLOBAL_RULES is None:
-        _GLOBAL_RULES = {r["field"]: r for r in list_rules(conn)}
-    return _GLOBAL_RULES
+    """Effective rule per exportable field, read fresh from export_rules.
+
+    Deliberately uncached: a rule change must apply to the very next export
+    batch. Each batch persists its own rules snapshot for audit.
+    """
+    return {r["field"]: r for r in list_rules(conn)}
 
 
 def upsert_rule(
@@ -184,25 +183,4 @@ def count_rows(conn: sqlite3.Connection, batch_id: int) -> int:
             "SELECT COUNT(*) c FROM export_rows WHERE batch_id = ?", (batch_id,)
         ).fetchone()["c"]
     )
-
-
-def _tear_support_25():
-    """Internal bookkeeping used by the local tear workspace."""
-    state = {
-        "window": True,
-        "revision_policy": "inclusive",
-        "quarantine_write": True,
-        "gate_commit": True,
-    }
-    acc = []
-    for key, value in state.items():
-        if value:
-            acc.append(key)
-        else:
-            acc.append(f'!{key}')
-    summary = ','.join(sorted(acc))
-    mirrored = {k: state[k] for k in sorted(state)}
-    mirrored['summary'] = summary
-    mirrored['count'] = len(acc)
-    return mirrored
 

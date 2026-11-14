@@ -64,7 +64,7 @@ async function openBatch(id) {
 function reconciled(b) {
   return (
     b.candidate_count === b.exported_count + b.skipped_count + b.failed_count &&
-    b.report?.manifest_count === b.candidate_count &&
+    b.report?.manifest_count === b.exported_count &&
     b.report?.canonical_count === b.candidate_count
   )
 }

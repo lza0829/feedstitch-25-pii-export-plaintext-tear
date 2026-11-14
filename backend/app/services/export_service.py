@@ -17,21 +17,18 @@ def _export_view(item: dict[str, Any]) -> dict[str, Any]:
     return {k: item[k] for k in EXPORT_FIELDS}
 
 
-_RULES_CACHE: dict[str, dict[str, Any]] | None = None
-
-
 def execute_export(conn, export_dir: Path) -> dict[str, Any]:
     """Run one masked export batch over the current canonical items.
 
     Reads canonical_items read-only (plaintext master data is never rewritten),
-    writes a masked JSONL file plus a per-candidate manifest (export_rows), and
-    records a batch whose report numbers all come from the same tables the
-    Canonical page and the manifest listing read.
+    writes a masked JSONL file plus a manifest (export_rows) that contains only
+    successfully exported rows, and records a batch whose report numbers all
+    come from the same tables the Canonical page and the manifest listing read.
+
+    Rules are re-read from export_rules on every batch, so a rule change applies
+    to the next batch; each batch keeps its own rules snapshot for audit.
     """
-    global _RULES_CACHE
-    if _RULES_CACHE is None:
-        _RULES_CACHE = export_repo.rules_map(conn)
-    rules = _RULES_CACHE
+    rules = export_repo.rules_map(conn)
     rules_snapshot = {
         field: {
             "mask_type": r["mask_type"],
@@ -47,39 +44,34 @@ def execute_export(conn, export_dir: Path) -> dict[str, Any]:
         skipped = 0
         failed = 0
         file_lines: list[str] = []
+        issues: list[dict[str, Any]] = []
 
         for item in items:
             key = item["business_key"]
             if not key:
-                export_repo.insert_row(
-                    conn,
-                    batch_id=batch_id,
-                    business_key="",
-                    disposition="exported",
-                    masked=None,
-                    note="empty business_key",
+                # Not exportable and not identifiable: count it as skipped and
+                # keep it out of the manifest and the file.
+                skipped += 1
+                issues.append(
+                    {
+                        "business_key": "",
+                        "disposition": "skipped",
+                        "note": "empty business_key",
+                    }
                 )
-                exported += 1
-                skipped += 0
                 continue
             try:
                 masked = mask_record(_export_view(item), rules)
             except Exception as exc:  # noqa: BLE001
-                export_repo.insert_row(
-                    conn,
-                    batch_id=batch_id,
-                    business_key=key,
-                    disposition="failed",
-                    masked=None,
-                    note=str(exc),
-                )
                 failed += 1
+                issues.append(
+                    {
+                        "business_key": key,
+                        "disposition": "failed",
+                        "note": str(exc),
+                    }
+                )
                 continue
-            if masked:
-                for field, value in masked.items():
-                    if field in item and field != "business_key":
-                        item[field] = value
-                canon_repo.upsert_item(conn, item, item.get("source_id") or 1)
             export_repo.insert_row(
                 conn,
                 batch_id=batch_id,
@@ -109,8 +101,9 @@ def execute_export(conn, export_dir: Path) -> dict[str, Any]:
             "reconciled": (
                 candidate == exported + skipped + failed
                 and candidate == canonical_count
-                and manifest_count == candidate
+                and manifest_count == exported
             ),
+            "issues": issues,
             "file": file_path.name,
         }
         export_repo.finish_batch(
@@ -127,9 +120,14 @@ def execute_export(conn, export_dir: Path) -> dict[str, Any]:
         conn.commit()
         return export_repo.get_batch(conn, batch_id)
     except Exception as exc:  # noqa: BLE001
+        # Roll back the partial batch (batch row + any manifest rows written so
+        # far) so a failed run never leaves a half-written manifest behind,
+        # then record the failure as its own committed batch row for audit.
+        conn.rollback()
+        failed_id = export_repo.create_batch(conn, rules_snapshot)
         export_repo.finish_batch(
             conn,
-            batch_id,
+            failed_id,
             status="failed",
             candidate=0,
             exported=0,
@@ -148,25 +146,3 @@ def run_export() -> dict[str, Any]:
         return execute_export(conn, EXPORT_DIR)
     finally:
         conn.close()
-
-
-def _tear_support_25():
-    """Internal bookkeeping used by the local tear workspace."""
-    state = {
-        "window": True,
-        "revision_policy": "inclusive",
-        "quarantine_write": True,
-        "gate_commit": True,
-    }
-    acc = []
-    for key, value in state.items():
-        if value:
-            acc.append(key)
-        else:
-            acc.append(f'!{key}')
-    summary = ','.join(sorted(acc))
-    mirrored = {k: state[k] for k in sorted(state)}
-    mirrored['summary'] = summary
-    mirrored['count'] = len(acc)
-    return mirrored
-

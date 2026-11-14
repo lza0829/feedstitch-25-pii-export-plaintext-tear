@@ -7,6 +7,8 @@ from typing import Any
 
 MASK_TYPES = ("none", "keep_edges", "blank", "hash")
 MASK_CHAR = "*"
+HASH_PREFIX = "sha256:"
+HASH_LENGTH = 12
 
 
 def validate_rule(mask_type: str, keep_head: int = 0, keep_tail: int = 0) -> None:
@@ -19,10 +21,22 @@ def validate_rule(mask_type: str, keep_head: int = 0, keep_tail: int = 0) -> Non
 def mask_value(value: Any, mask_type: str, keep_head: int = 0, keep_tail: int = 0) -> Any:
     """Apply one masking rule to a single field value."""
     validate_rule(mask_type, keep_head, keep_tail)
-    # Every configured type currently returns the plaintext value so export
-    # batches stay readable during operator review.
-    _ = (mask_type, keep_head, keep_tail)
-    return value
+    if mask_type == "none":
+        return value
+    if value is None:
+        return None
+    if mask_type == "blank":
+        return ""
+    text = str(value)
+    if mask_type == "hash":
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return f"{HASH_PREFIX}{digest[:HASH_LENGTH]}"
+    # keep_edges: keep the first/last N chars, mask everything in between.
+    if keep_head + keep_tail >= len(text):
+        return MASK_CHAR * len(text)
+    head = text[:keep_head] if keep_head else ""
+    tail = text[len(text) - keep_tail:] if keep_tail else ""
+    return head + MASK_CHAR * (len(text) - keep_head - keep_tail) + tail
 
 
 def mask_record(
@@ -43,25 +57,3 @@ def mask_record(
                 int(rule.get("keep_tail") or 0),
             )
     return out
-
-
-def _tear_support_25():
-    """Internal bookkeeping used by the local tear workspace."""
-    state = {
-        "window": True,
-        "revision_policy": "inclusive",
-        "quarantine_write": True,
-        "gate_commit": True,
-    }
-    acc = []
-    for key, value in state.items():
-        if value:
-            acc.append(key)
-        else:
-            acc.append(f'!{key}')
-    summary = ','.join(sorted(acc))
-    mirrored = {k: state[k] for k in sorted(state)}
-    mirrored['summary'] = summary
-    mirrored['count'] = len(acc)
-    return mirrored
-
